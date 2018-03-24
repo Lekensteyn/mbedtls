@@ -78,6 +78,67 @@ static void my_debug( void *ctx, int level,
     fflush(  (FILE *) ctx  );
 }
 
+typedef struct {
+    FILE *file;
+    int in_client_random : 1;
+    int in_master_secret : 1;
+    int hexdump_lines_to_process;
+} keylog_debug_ctx;
+
+void keylog_debug_callback( void *ctx, int level,
+                            const char *file, int line,
+                            const char *str )
+{
+    keylog_debug_ctx *c = (keylog_debug_ctx *) ctx;
+
+    ((void) level); ((void) file); ((void) line);
+
+    if (strstr(str, "dumping 'client hello, random bytes' (32 bytes)")) {
+        c->in_client_random = 1;
+        c->hexdump_lines_to_process = 2;
+        fputs("CLIENT_RANDOM ", c->file);
+        return;
+    } else if (strstr(str, "dumping 'master secret' (48 bytes)")) {
+        c->in_master_secret = 1;
+        c->hexdump_lines_to_process = 3;
+        fputc(' ', c->file);
+        return;
+    } else if ((!c->in_client_random && !c->in_master_secret) ||
+               c->hexdump_lines_to_process == 0) {
+        return;
+    }
+
+    /* Parse "0000:  64 df 18 71 ca 4a 4b e4 63 87 2a ef 5f 29 ca ff  ..." */
+    str = strstr(str, ":  ");
+    if (!str || strlen(str) < 3 + 3*16) {
+        goto reset;         /* not the expected hex buffer */
+    }
+    str += 3;               /* skip over ":  " */
+
+    /* Process sequences of "hh " */
+    for (int i = 0; i < 3 * 16; i += 3) {
+        char c1 = str[i], c2 = str[i + 1], c3 = str[i + 2];
+        if ((('0' <= c1 && c1 <= '9') || ('a' <= c1 && c1 <= 'f')) &&
+            (('0' <= c2 && c2 <= '9') || ('a' <= c2 && c2 <= 'f')) &&
+            c3 == ' ') {
+            fputc(c1, c->file);
+            fputc(c2, c->file);
+        } else {
+            goto reset;     /* unexpected non-hex char */
+        }
+    }
+
+    if (--c->hexdump_lines_to_process != 0 || !c->in_master_secret) {
+        return;             /* line is not yet finished. */
+    }
+
+reset:
+    c->hexdump_lines_to_process = 0;
+    c->in_client_random = c->in_master_secret = 0;
+    fputc('\n', c->file);   /* finish key log line */
+    fflush(c->file);
+}
+
 int main( void )
 {
     int ret, len;
@@ -91,6 +152,8 @@ int main( void )
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_x509_crt cacert;
+
+    keylog_debug_ctx debug_ctx = { };
 
 #if defined(MBEDTLS_DEBUG_C)
     mbedtls_debug_set_threshold( DEBUG_LEVEL );
@@ -173,6 +236,19 @@ int main( void )
     mbedtls_ssl_conf_ca_chain( &conf, &cacert, NULL );
     mbedtls_ssl_conf_rng( &conf, mbedtls_ctr_drbg_random, &ctr_drbg );
     mbedtls_ssl_conf_dbg( &conf, my_debug, stdout );
+
+    mbedtls_debug_set_threshold( 4 );
+    {
+        const char *keylog_filename = getenv("SSLKEYLOGFILE");
+        if (keylog_filename) {
+            debug_ctx.file = fopen(keylog_filename, "a");
+        } else {
+            debug_ctx.file = stderr;
+        }
+    }
+    if (debug_ctx.file) {
+        mbedtls_ssl_conf_dbg( &conf, keylog_debug_callback, &debug_ctx );
+    }
 
     if( ( ret = mbedtls_ssl_setup( &ssl, &conf ) ) != 0 )
     {
